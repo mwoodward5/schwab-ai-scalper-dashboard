@@ -1,3 +1,10 @@
+/**
+ * Global error handling middleware and APIError class.
+ *
+ * Usage:
+ *  - Throw new APIError(message, statusCode, details) in routes/services
+ *  - Register errorHandler LAST in the middleware chain
+ */
 const logger = require('../utils/logger');
 
 /**
@@ -34,48 +41,13 @@ const errorHandler = (err, req, res, next) => {
   // Prepare error response
   const errorResponse = {
     success: false,
-    error: err.message || 'Internal server error',
-    timestamp: new Date().toISOString(),
+    error: err.message || 'Internal Server Error',
   };
-
-  // Include additional details in development mode
-  if (process.env.NODE_ENV === 'development') {
-    errorResponse.stack = err.stack;
+  if (process.env.NODE_ENV !== 'production' && err.details) {
     errorResponse.details = err.details;
   }
 
-  // Handle specific error types
-  if (err.name === 'ValidationError') {
-    errorResponse.error = 'Validation Error';
-    errorResponse.validationErrors = err.details;
-  } else if (err.name === 'UnauthorizedError') {
-    errorResponse.error = 'Authentication required';
-  } else if (err.code === 'ECONNREFUSED') {
-    errorResponse.error = 'Unable to connect to external service';
-  }
-
-  // Send error response
   res.status(statusCode).json(errorResponse);
 };
 
-/**
- * 404 handler for routes that don't exist
- */
-const notFoundHandler = (req, res, next) => {
-  const error = new APIError(`Route not found: ${req.originalUrl}`, 404);
-  next(error);
-};
-
-/**
- * Async route wrapper to catch promise rejections
- */
-const asyncHandler = (fn) => (req, res, next) => {
-  Promise.resolve(fn(req, res, next)).catch(next);
-};
-
-module.exports = {
-  errorHandler,
-  notFoundHandler,
-  asyncHandler,
-  APIError,
-};
+module.exports = { errorHandler, APIError };
