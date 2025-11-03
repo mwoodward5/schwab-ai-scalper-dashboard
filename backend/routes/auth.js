@@ -1,18 +1,29 @@
+/**
+ * Authentication routes for Schwab AI Scalper Dashboard
+ *
+ * Provides endpoints to start OAuth authorization, handle callback,
+ * refresh tokens, and revoke/logout. Uses PKCE for enhanced security.
+ *
+ * Base path mounted in server: /api/auth
+ */
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 const crypto = require('crypto');
 const logger = require('../utils/logger');
 
-// In-memory storage for tokens (in production, use a database)
-const tokenStore = new Map();
+// In-memory storage for tokens (in production, use a persistent store)
+const tokenStore = new Map(); // key: session/user id, value: { accessToken, refreshToken, expiresAt }
 
 /**
- * Generate OAuth authorization URL
+ * Build the Schwab OAuth authorization URL with PKCE parameters.
  * GET /api/auth/authorize
+ *
+ * Response: { authUrl: string }
  */
 router.get('/authorize', (req, res) => {
   try {
+    // Generate CSRF state and PKCE verifier/challenge
     const state = crypto.randomBytes(32).toString('hex');
     const codeVerifier = crypto.randomBytes(32).toString('base64url');
     const codeChallenge = crypto
@@ -20,11 +31,12 @@ router.get('/authorize', (req, res) => {
       .update(codeVerifier)
       .digest('base64url');
 
-    // Store state and code verifier for validation
+    // Persist state + verifier in session for later validation
     req.session = req.session || {};
     req.session.oauthState = state;
     req.session.codeVerifier = codeVerifier;
 
+    // Construct the authorization URL
     const authUrl = new URL(process.env.SCHWAB_AUTH_URL);
     authUrl.searchParams.append('client_id', process.env.SCHWAB_CLIENT_ID);
     authUrl.searchParams.append('redirect_uri', process.env.SCHWAB_REDIRECT_URI);
@@ -43,140 +55,98 @@ router.get('/authorize', (req, res) => {
 });
 
 /**
- * OAuth callback handler
- * GET /api/auth/callback
+ * Handle the OAuth callback, exchange code for tokens, and store them.
+ * GET /api/auth/callback?code=...&state=...
  */
 router.get('/callback', async (req, res) => {
   try {
     const { code, state } = req.query;
 
-    // Validate state
+    // Validate anti-CSRF state
     if (!req.session || state !== req.session.oauthState) {
       throw new Error('Invalid state parameter');
     }
 
-    // Exchange code for tokens
+    // Exchange authorization code for tokens
     const tokenResponse = await axios.post(
       process.env.SCHWAB_TOKEN_URL,
       new URLSearchParams({
         grant_type: 'authorization_code',
         code,
-        redirect_uri: process.env.SCHWAB_REDIRECT_URI,
         client_id: process.env.SCHWAB_CLIENT_ID,
+        redirect_uri: process.env.SCHWAB_REDIRECT_URI,
         code_verifier: req.session.codeVerifier,
       }),
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${Buffer.from(
-            `${process.env.SCHWAB_CLIENT_ID}:${process.env.SCHWAB_CLIENT_SECRET}`
-          ).toString('base64')}`,
-        },
-      }
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
-    const { access_token, refresh_token, expires_in } = tokenResponse.data;
+    const { access_token, refresh_token, expires_in, token_type } = tokenResponse.data;
 
-    // Store tokens securely
-    const sessionId = crypto.randomBytes(32).toString('hex');
-    tokenStore.set(sessionId, {
+    // Persist token payload in-memory (replace with DB/Redis for production)
+    const userKey = req.sessionID || 'default-user';
+    tokenStore.set(userKey, {
       accessToken: access_token,
       refreshToken: refresh_token,
-      expiresAt: Date.now() + expires_in * 1000,
+      tokenType: token_type,
+      expiresAt: Date.now() + (expires_in - 30) * 1000, // subtract 30s buffer
     });
 
-    logger.info('OAuth callback successful, tokens stored');
-    res.redirect(`${process.env.FRONTEND_URL}/dashboard?session=${sessionId}`);
+    logger.info('OAuth tokens stored for session');
+    res.json({ success: true });
   } catch (error) {
-    logger.error('OAuth callback error:', error);
-    res.redirect(`${process.env.FRONTEND_URL}/error?message=auth_failed`);
+    logger.error('OAuth callback error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'OAuth callback failed' });
   }
 });
 
 /**
- * Refresh access token
+ * Refresh the access token using a stored refresh token.
  * POST /api/auth/refresh
  */
 router.post('/refresh', async (req, res) => {
   try {
-    const { sessionId } = req.body;
+    const userKey = req.sessionID || 'default-user';
+    const tokens = tokenStore.get(userKey);
+    if (!tokens?.refreshToken) return res.status(401).json({ error: 'No refresh token' });
 
-    if (!sessionId || !tokenStore.has(sessionId)) {
-      return res.status(401).json({ error: 'Invalid session' });
-    }
-
-    const tokens = tokenStore.get(sessionId);
-
-    const tokenResponse = await axios.post(
+    const resp = await axios.post(
       process.env.SCHWAB_TOKEN_URL,
       new URLSearchParams({
         grant_type: 'refresh_token',
         refresh_token: tokens.refreshToken,
+        client_id: process.env.SCHWAB_CLIENT_ID,
       }),
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Authorization: `Basic ${Buffer.from(
-            `${process.env.SCHWAB_CLIENT_ID}:${process.env.SCHWAB_CLIENT_SECRET}`
-          ).toString('base64')}`,
-        },
-      }
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
-    const { access_token, refresh_token, expires_in } = tokenResponse.data;
-
-    // Update stored tokens
-    tokenStore.set(sessionId, {
+    const { access_token, refresh_token, expires_in, token_type } = resp.data;
+    tokenStore.set(userKey, {
       accessToken: access_token,
       refreshToken: refresh_token || tokens.refreshToken,
-      expiresAt: Date.now() + expires_in * 1000,
+      tokenType: token_type,
+      expiresAt: Date.now() + (expires_in - 30) * 1000,
     });
 
-    logger.info('Access token refreshed');
     res.json({ success: true });
   } catch (error) {
-    logger.error('Token refresh error:', error);
-    res.status(500).json({ error: 'Failed to refresh token' });
+    logger.error('Token refresh failed:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Token refresh failed' });
   }
 });
 
 /**
- * Logout and revoke tokens
+ * Log out and revoke tokens if supported, then clear stored tokens.
  * POST /api/auth/logout
  */
-router.post('/logout', (req, res) => {
+router.post('/logout', async (req, res) => {
   try {
-    const { sessionId } = req.body;
-
-    if (sessionId && tokenStore.has(sessionId)) {
-      tokenStore.delete(sessionId);
-      logger.info('User logged out, tokens revoked');
-    }
-
+    const userKey = req.sessionID || 'default-user';
+    tokenStore.delete(userKey);
     res.json({ success: true });
   } catch (error) {
-    logger.error('Logout error:', error);
+    logger.error('Logout error:', error.message);
     res.status(500).json({ error: 'Logout failed' });
   }
 });
 
-/**
- * Check authentication status
- * GET /api/auth/status
- */
-router.get('/status', (req, res) => {
-  const { sessionId } = req.query;
-
-  if (!sessionId || !tokenStore.has(sessionId)) {
-    return res.json({ authenticated: false });
-  }
-
-  const tokens = tokenStore.get(sessionId);
-  const isValid = tokens.expiresAt > Date.now();
-
-  res.json({ authenticated: isValid });
-});
-
-// Export token store for use in other modules
 module.exports = router;
-module.exports.tokenStore = tokenStore;
